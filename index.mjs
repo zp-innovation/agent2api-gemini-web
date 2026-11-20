@@ -207,9 +207,10 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
       }, {
         type: 'oauth',
         label: '添加本地后端里已有的 Google 账号',
-        // Magpie asks through ask(), listing the pool as it is now; prompts holds the question
-        // for OpenCode, and makes Magpie hand authorize the answer.
-        prompts: [{ type: 'select', key: 'account', message: '选择 Google 账号', options: [] }],
+        // The picker is ask()'s alone. A host reads declared prompts before it calls ask(), and
+        // one rejects the whole login list over a declared select with no options (the pool only
+        // exists at sign-in time), so declaring the question here would break provider setup.
+        prompts: [],
         async ask(inputs) {
           if (inputs?.account) return null;
           if (!localBackend()) throw new Error('还没有本地后端：请先用「一键配置本地 Gemini Web」');
@@ -226,9 +227,10 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
         async authorize(inputs) {
           const local = localBackend();
           if (!local) throw new Error('还没有本地后端：请先用「一键配置本地 Gemini Web」');
-          const id = Number(inputs?.account);
+          if (!inputs?.account) throw new Error('还没有选择 Google 账号：本地后端里已有的账号会在这里列出来');
+          const id = Number(inputs.account);
           const chosen = (await poolChoices()).find(c => c.id === id);
-          if (!chosen) throw new Error(`本地后端里没有启用的账号 #${inputs?.account}`);
+          if (!chosen) throw new Error(`本地后端里没有启用的账号 #${inputs.account}`);
           return {
             url: '',
             method: 'auto',

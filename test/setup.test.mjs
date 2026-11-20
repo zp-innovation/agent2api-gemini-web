@@ -595,7 +595,9 @@ describe('27. One-click sign-in through the plugin', () => {
     };
     try {
       const method = (await GeminiWebPlugin({})).auth.methods[2];
-      assert.equal(method.prompts[0].key, 'account');
+      // The picker is ask()'s: a declared select would need the pool at load time, and a host
+      // refuses a declared select without options.
+      assert.deepEqual(method.prompts, []);
       const question = await method.ask({});
       assert.equal(question.type, 'select');
       assert.deepEqual(question.options.map(o => [o.label, o.value]), [['pool-a@gmail.com', '41'], ['#42', '42']]);
@@ -609,6 +611,7 @@ describe('27. One-click sign-in through the plugin', () => {
         metadata: { baseURL: `http://127.0.0.1:${server.address().port}/v1`, account: 41, email: 'pool-a@gmail.com' }
       });
       await assert.rejects(method.authorize({ account: '43' }), /没有启用的账号 #43/);
+      await assert.rejects(method.authorize({}), /还没有选择 Google 账号/);
     } finally {
       globalThis.fetch = realFetch;
       db.exec(`DELETE FROM accounts WHERE id IN (41, 42, 43); UPDATE accounts SET status = 'enabled';`);
