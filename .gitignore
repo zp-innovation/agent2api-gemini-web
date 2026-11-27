@@ -20,3 +20,4 @@ __pycache__/
 docs/research/
 docs/design/
 scripts/research/
+.tmp-*.log

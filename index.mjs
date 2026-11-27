@@ -39,15 +39,27 @@ const COOKIE_STEPS = [
 // one account, and two with neither for one when their key is the same). The account is the
 // pool's own entry (see poolAccounts), which says the way out to read the email by; without
 // one the email isn't read.
-async function signInFor(local, account) {
+//
+// The sign-in also carries what it takes to put the account back: the backend this plugin set up
+// lives in a data dir inside whatever holds Magpie, so an update of the host that replaces that
+// container takes the backend, its key and its whole account pool with it. Magpie saves this
+// metadata encrypted with the other credentials, so the cookie here is the one copy that survives
+// — managed: true says the backend is ours to rebuild, and healManaged re-imports the cookie into
+// the pool it comes back with. extra.cookie is the normalized cookie (see parseCookieInput).
+async function signInFor(local, account, extra = {}) {
   const email = account.email || await accountEmail(account).catch(() => undefined);
+  // A pool entry read by poolAccounts carries its cookie; 添加本地后端里已有的 Google 账号 signs
+  // in with one of those, and it heals the same way.
+  const cookie = extra.cookie || account.cookie;
   return {
     type: 'success',
     key: local.apiKey,
     metadata: {
-      baseURL: local.baseURL, account: account.id, ...(email ? { email } : {}),
+      baseURL: local.baseURL, account: account.id, managed: true, ...(email ? { email } : {}),
       // The account index (/u/N) the email is for; usage takes the email only while it holds.
-      ...(email && account.authuser > 0 ? { authuser: account.authuser } : {})
+      ...(email && account.authuser > 0 ? { authuser: account.authuser } : {}),
+      ...(cookie ? { cookie } : {}),
+      ...(extra.proxy ? { proxy: extra.proxy } : {})
     }
   };
 }
@@ -57,6 +69,43 @@ function managedBackend(baseURL, key) {
   if (isPluginRemovedInActiveMagpie()) return null;
   const local = localBackend() || (key ? localSetup() : null);
   return local && local.baseURL === baseURL && (!key || local.apiKey === key) ? local : null;
+}
+
+// managedSignIn is the backend a sign-in made through this plugin reaches: a sign-in it didn't
+// make (连接已有后端) is left to its own baseURL and key. ensureBackend is idempotent and starts
+// the backend when a host update took it, which is also when the key Magpie saved stops matching
+// — the setup returned here is the one to use, not the metadata's.
+async function managedSignIn(auth, opts) {
+  const meta = auth?.metadata || {};
+  if (meta.managed !== true) return null;
+  const local = await ensureBackend({ proxy: meta.proxy || opts.proxy });
+  return local && local.baseURL === meta.baseURL ? local : null;
+}
+
+// healManaged puts the sign-in's account back into the pool of the backend it reaches, and says
+// which entry it is now: after a host update the pool is empty, so the id the sign-in saved names
+// nothing and every read of it fails. The entry is looked up by id, then by email (a re-import
+// numbers it anew), and imported from the sign-in's own cookie when neither finds it. A backend
+// that already has it is left alone; the lookup is throttled because the loader runs on every
+// request and a healthy backend would be read for the pool each time.
+const HEAL_TTL_MS = 60 * 1000;
+const healedAt = new Map();
+
+async function healManaged(local, auth) {
+  const meta = auth?.metadata || {};
+  const key = `${local.baseURL}|${meta.account}|${meta.email || ''}`;
+  const last = healedAt.get(key);
+  if (last && Date.now() - last < HEAL_TTL_MS) return null;
+  const pool = await poolAccounts().catch(() => []);
+  const found = pool.find(a => a.id === meta.account) || (meta.email ? pool.find(a => a.email === meta.email) : null);
+  healedAt.set(key, Date.now());
+  if (found) return found;
+  if (!meta.cookie) return null;
+  const added = await importCookie(local, parseCookieInput(meta.cookie), {
+    ...(meta.authuser > 0 ? { authuser: meta.authuser } : {}),
+    ...(meta.proxy ? { proxy: meta.proxy } : {})
+  });
+  return (await poolAccounts().catch(() => [])).find(a => a.id === added.id) || { id: added.id };
 }
 
 // forwardManaged is forward(), but when the backend this plugin manages can't be reached it
@@ -206,7 +255,7 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
                 return { type: 'failed', error: hint ? `${err.message}\n${hint}` : err.message };
               }
               const account = (await poolAccounts().catch(() => [])).find(a => a.id === added.id);
-              return signInFor(local, account || { id: added.id });
+              return signInFor(local, account || { id: added.id }, { cookie, proxy });
             }
           };
         }
@@ -229,7 +278,7 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
             const local = await ensureBackend({ proxy });
             const added = await importCookie(local, cookie, { authuser, ...(proxy ? { proxy } : {}) });
             const account = (await poolAccounts().catch(() => [])).find(a => a.id === added.id);
-            return signInFor(local, account || { id: added.id });
+            return signInFor(local, account || { id: added.id }, { cookie, proxy });
           } catch (err) {
             const hint = dockerProxyHint(proxy);
             throw new Error(hint ? `${err.message}\n${hint}` : err.message);
@@ -289,18 +338,27 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
             url: '',
             method: 'auto',
             instructions: '',
-            callback: async () => signInFor(local, chosen)
+            callback: async () => {
+              const account = (await poolAccounts().catch(() => [])).find(a => a.id === chosen.id) || chosen;
+              return signInFor(local, account);
+            }
           };
         }
       }],
+      // The key and address are the backend's as it is now, not as the sign-in saved them: a host
+      // update that took the backend leaves the saved key naming a backend that no longer exists,
+      // and this starts it again under the key it comes back with. The pool is healed alongside so
+      // the first request after the update is served by the same account it was before.
       async loader(getAuth) {
         const auth = await getAuth();
         if (retiredTask(auth)) throw retiredTaskError();
         if (auth?.type !== 'api') return {};
         const c = credentials(auth, opts);
+        const local = await managedSignIn(auth, opts).catch(() => null);
+        if (local) await healManaged(local, auth).catch(() => {});
         return {
-          apiKey: c.key,
-          baseURL: c.baseURL,
+          apiKey: local ? local.apiKey : c.key,
+          baseURL: local ? local.baseURL : c.baseURL,
           fetch: (input, init) => forwardManaged(input, init, getAuth, opts)
         };
       },
@@ -318,10 +376,17 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
         } catch (err) {
           return { error: err.message, credits: [], signIn: 'kept' };
         }
-        if (!managedBackend(c.baseURL, c.key)) {
+        // A backend this plugin set up is rebuilt when a host update took it, so a saved key that
+        // no longer matches is not a reason to stop reading: the card is the one thing that would
+        // stay red otherwise. 连接已有后端 is still out of reach, as its pool is not ours.
+        const local = await managedSignIn(auth, opts).catch(() => null);
+        if (!local && !managedBackend(c.baseURL, c.key)) {
           return { error: '只能读取插件自己管理的本地后端的额度（连接已有后端时读不到）', credits: [], signIn: 'kept' };
         }
-        const { account, email, authuser } = auth.metadata || {};
+        const meta = auth.metadata || {};
+        const healed = local ? await healManaged(local, auth).catch(() => null) : null;
+        const account = healed && Number.isInteger(healed.id) ? healed.id : meta.account;
+        const { email, authuser } = meta;
         return { ...(await usage(Number.isInteger(account) ? { account, email, authuser } : {})), signIn: 'kept' };
       }
     },
@@ -331,12 +396,14 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
         if (auth?.type !== 'api') return provider.models;
         if (retiredTask(auth)) throw retiredTaskError();
         const c = credentials(auth, opts);
+        const local = await managedSignIn(auth, opts).catch(() => null);
+        const reach = local ? { ...c, key: local.apiKey, baseURL: local.baseURL } : c;
         try {
-          return await listModels(c, opts);
+          return await listModels(reach, opts);
         } catch (err) {
-          if (!err.unreachable || !managedBackend(c.baseURL, c.key)) throw err;
+          if (!err.unreachable || !managedBackend(reach.baseURL, reach.key)) throw err;
           await ensureBackend({ proxy: opts.proxy });
-          return listModels(c, opts);
+          return listModels(reach, opts);
         }
       }
     }

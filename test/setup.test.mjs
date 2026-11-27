@@ -594,11 +594,16 @@ describe('27. One-click sign-in through the plugin', () => {
     } finally {
       globalThis.fetch = realFetch;
     }
-    assert.deepEqual(result, {
-      type: 'success',
-      key: 'gw_test',
-      metadata: { baseURL: `http://127.0.0.1:${server.address().port}/v1`, account: [...accounts.keys()][0], email: 'setup@gmail.com' }
+    const { cookie, ...rest } = result.metadata;
+    assert.deepEqual(rest, {
+      baseURL: `http://127.0.0.1:${server.address().port}/v1`,
+      account: [...accounts.keys()][0],
+      email: 'setup@gmail.com',
+      managed: true
     });
+    // The sign-in keeps the cookie it was made with: it is what puts the account back into a
+    // backend a host update replaced (see healManaged in index.mjs).
+    assert.equal(cookie, parseCookieInput(`cookie: ${SIGNED_IN.replace('SID=v-SID', 'SID=good')}`));
     assert.equal(accounts.size, 1);
   });
 
@@ -656,11 +661,13 @@ describe('27. One-click sign-in through the plugin', () => {
 
       const pending = await method.authorize({ account: '41' });
       assert.equal(pending.method, 'auto');
-      assert.deepEqual(await pending.callback(), {
-        type: 'success',
-        key: 'gw_test',
-        metadata: { baseURL: `http://127.0.0.1:${server.address().port}/v1`, account: 41, email: 'pool-a@gmail.com' }
+      const { cookie, ...rest } = (await pending.callback()).metadata;
+      assert.deepEqual(rest, {
+        baseURL: `http://127.0.0.1:${server.address().port}/v1`, account: 41, email: 'pool-a@gmail.com', managed: true
       });
+      // An account already in the pool signs in with the cookie the pool keeps for it, so it is
+      // healed the same way as one imported here.
+      assert.equal(cookie, 'SID=pool-a');
       await assert.rejects(method.authorize({ account: '43' }), /没有启用的账号 #43/);
       await assert.rejects(method.authorize({}), /还没有选择 Google 账号/);
     } finally {
@@ -770,5 +777,150 @@ describe('27. One-click sign-in through the plugin', () => {
       globalThis.fetch = realFetch;
       db.exec('DELETE FROM proxies');
     }
+  });
+});
+
+
+// A host update replaces whatever holds the plugin's backend: the backend, its key and its whole
+// account pool go with it, while Magpie keeps the sign-in it saved. These pin what the plugin
+// does about that (managedSignIn and healManaged in index.mjs).
+describe('29. A host update that takes the backend', () => {
+  const PROXY_ENV = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy', 'GEMINI_WEB_PROXY'];
+  const savedEnv = {};
+  let server;
+  let dataDir;
+  let previousDataDir;
+  let db;
+  let nextId = 500;
+  const accounts = new Map();
+
+  // What the Usage page's query answers, cut to what the plugin reads.
+  const reply = (five, week) => JSON.stringify([{
+    data: {
+      viewer: {
+        rpcs: {
+          getUsageInfo: {
+            subscriptionTier: 'TIER1',
+            pools: [
+              { poolType: 'GXU_FIVE_HOURLY', percentageUsed: five, gxu: { windowRefreshesAt: '2026-10-14T11:48:06.036796Z' } },
+              { poolType: 'GXU_WEEKLY', percentageUsed: week, gxu: { windowRefreshesAt: '2026-10-20T23:48:06.036796Z' } }
+            ]
+          }
+        }
+      }
+    },
+    path: []
+  }]);
+
+  before(async () => {
+    PROXY_ENV.forEach(k => { savedEnv[k] = process.env[k]; delete process.env[k]; });
+    server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => { body += c; });
+      req.on('end', () => {
+        const send = (status, data) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(data));
+        };
+        if (req.url === '/') return send(200, LOGIN_CAPABILITIES);
+        // The backend answers under the key its new secrets.json holds.
+        if (req.url === '/v1/models') {
+          return req.headers.authorization === 'Bearer gw_test' ? send(200, { data: [] }) : send(401, { error: 'bad key' });
+        }
+        if (req.headers.authorization !== 'Bearer admin_test') return send(401, { error: 'bad admin token' });
+        if (req.method === 'GET' && req.url === '/admin/api/cookies') {
+          const items = db.prepare('SELECT id, proxy_id FROM accounts ORDER BY id').all();
+          return send(200, { items, total: items.length, enabled: items.length });
+        }
+        if (req.method === 'POST' && req.url === '/admin/api/cookies') {
+          const parsed = JSON.parse(body);
+          const id = nextId++;
+          accounts.set(id, { cookie: parsed.cookie });
+          db.prepare(`INSERT INTO accounts (id, label, cookie, status, proxy_id, authuser) VALUES (?, 'Magpie', ?, 'enabled', 0, ?)`)
+            .run(id, parsed.cookie, parsed.authuser ?? 0);
+          return send(200, { id });
+        }
+        if (req.method === 'POST' && /^\/admin\/api\/cookies\/\d+\/check$/.test(req.url)) {
+          return send(200, { ok: true, detail: 'ok' });
+        }
+        send(404, { error: 'not found' });
+      });
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    dataDir = makeDataDir({ port: server.address().port, platform: process.platform });
+    // The binary the update left behind is the one the pin names, and the backend answers, so
+    // ensureBackend starts and installs nothing: it finds the backend it set up again.
+    trustBinary(dataDir, process.platform);
+    db = new DatabaseSync(path.join(dataDir, 'gemini.db'));
+    db.exec(`CREATE TABLE proxies (id INTEGER PRIMARY KEY, name TEXT, url TEXT, enabled INTEGER);
+      CREATE TABLE accounts (id INTEGER PRIMARY KEY, label TEXT, cookie TEXT, status TEXT, proxy_id INTEGER,
+        last_used_at INTEGER NOT NULL DEFAULT 0, authuser INTEGER NOT NULL DEFAULT 0);`);
+    previousDataDir = process.env.GEMINI_WEB_DATA_DIR;
+    process.env.GEMINI_WEB_DATA_DIR = dataDir;
+  });
+
+  after(() => {
+    server.close();
+    db.close();
+    PROXY_ENV.forEach(k => {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    });
+    if (previousDataDir === undefined) delete process.env.GEMINI_WEB_DATA_DIR;
+    else process.env.GEMINI_WEB_DATA_DIR = previousDataDir;
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  // A sign-in as Magpie saved it: the key of a backend that no longer exists, and what it takes
+  // to put the account back.
+  const signIn = metadata => async () => ({
+    type: 'api',
+    key: 'gw_old',
+    metadata: { baseURL: `http://127.0.0.1:${server.address().port}/v1`, managed: true, ...metadata }
+  });
+
+  it('signs in with the key the rebuilt backend comes back with', async () => {
+    const plugin = await GeminiWebPlugin({});
+    const cookie = `${SIGNED_IN}; NID=loader`;
+    const loaded = await plugin.auth.loader(signIn({ account: 7, email: 'loader@gmail.com', cookie }));
+    assert.equal(loaded.apiKey, 'gw_test');
+    assert.equal(loaded.baseURL, `http://127.0.0.1:${server.address().port}/v1`);
+    // The pool has the account again, under the cookie the sign-in kept.
+    assert.deepEqual([...accounts.values()].map(a => a.cookie), [cookie]);
+  });
+
+  it('reads the card of an account the emptied pool no longer has', async () => {
+    const plugin = await GeminiWebPlugin({});
+    const cookie = `${SIGNED_IN}; NID=usage`;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (url, init) => {
+      const target = String(url);
+      if (target === 'https://gemini.google.com/app') {
+        return Promise.resolve(new Response('<script>window.WIZ_global_data = {"oPEP7c":"usage@gmail.com"};</script>'));
+      }
+      if (target.startsWith('https://gemini.google.com/')) return Promise.resolve(new Response(reply(0.4, 0.2)));
+      return realFetch(url, init);
+    };
+    try {
+      const out = await plugin.auth.usage(signIn({ account: 8, email: 'usage@gmail.com', cookie }));
+      assert.equal(out.error, undefined);
+      assert.equal(out.user, 'usage@gmail.com');
+      assert.equal(out.signIn, 'kept');
+      assert.deepEqual(out.credits.map(c => c.remainingPercent), [60, 80]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(accounts.size, 2, 'the account was put back before the read, not read from a pool that has it');
+  });
+
+  it('leaves a backend the plugin did not set up alone', async () => {
+    const plugin = await GeminiWebPlugin({});
+    const getAuth = async () => ({ type: 'api', key: 'other_key', metadata: { baseURL: 'http://127.0.0.1:9/v1' } });
+    const loaded = await plugin.auth.loader(getAuth);
+    assert.equal(loaded.apiKey, 'other_key');
+    assert.equal(loaded.baseURL, 'http://127.0.0.1:9/v1');
+    const out = await plugin.auth.usage(getAuth);
+    assert.match(out.error, /本地后端/);
+    assert.equal(accounts.size, 2);
   });
 });
