@@ -351,6 +351,19 @@ describe('28. Gemini usage limits', () => {
     assert.match((await usage({ poolAccounts: accounts, fetchFn, account: 99 })).error, /已经没有这个账号（#99）/);
   });
 
+  it('reads the account left when the sign-in names an id the backend no longer has', async () => {
+    const one = async () => [{ id: 91, cookie: 'stale-a', pooled: 0 }];
+    const fetchFn = fakeFetch({ 'stale-a': reply(0.4, 0.2) }, [], { 'stale-a': 'jack@gmail.com' });
+    const out = await usage({ poolAccounts: one, fetchFn, account: 3, email: 'jack@gmail.com' });
+    // The email is kept per backend id across reads, so any cached name is fine here.
+    assert.match(out.user, /@gmail\.com$/);
+    assert.deepEqual(out.windows.map(w => w.used), [40, 20]);
+
+    // Two accounts left: which one the sign-in meant is unknowable, so the card names them.
+    const two = async () => [{ id: 92, cookie: 'a', pooled: 0 }, { id: 93, cookie: 'b', pooled: 0 }];
+    assert.match((await usage({ poolAccounts: two, fetchFn, account: 3 })).error, /现在启用的是 #92、#93/);
+  });
+
   it('reads enabled accounts, their proxy and whether the pool has any from the backend database', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'magpie-gemini-web-usage-'));
     const db = new DatabaseSync(path.join(dir, 'gemini.db'));
