@@ -9,7 +9,7 @@ import { EventEmitter } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { GeminiWebPlugin } from '../index.mjs';
 import { binaryPath, ensureBackend, installBackend, localBackend, pinnedBinary } from '../lib/native.mjs';
-import { parseCookieInput, parseAuthuser, importCookie, ensureProxy, validateProxyURL, requireLoginBackend, REQUIRED_COOKIES } from '../lib/setup.mjs';
+import { parseCookieInput, looksLikeCookieMaterial, parseAuthuser, importCookie, ensureProxy, validateProxyURL, requireLoginBackend, REQUIRED_COOKIES } from '../lib/setup.mjs';
 
 const LOGIN_CAPABILITIES = { capabilities: { account_proxy_binding: true } };
 
@@ -72,6 +72,17 @@ describe('Google session index', () => {
     for (const value of [undefined, null, '', ' ', '0', 0]) assert.equal(parseAuthuser(value), 0);
     for (const value of [4, '4', ' 4 ']) assert.equal(parseAuthuser(value), 4);
     assert.equal(parseAuthuser('9'), 9);
+  });
+
+  it('tells a pasted cookie apart from an index', () => {
+    const json = JSON.stringify(REQUIRED_COOKIES.map(n => ({ name: n, value: `v-${n}`, domain: '.google.com' })));
+    assert.ok(looksLikeCookieMaterial(json));
+    assert.ok(looksLikeCookieMaterial(SIGNED_IN));
+    assert.ok(!looksLikeCookieMaterial('0'));
+    assert.ok(!looksLikeCookieMaterial(''));
+    assert.throws(() => parseAuthuser(json), /这里只填 Google 账号索引的数字/);
+    assert.throws(() => parseAuthuser(SIGNED_IN), /粘贴 Cookie 直接登录/);
+    assert.equal(parseAuthuser('4'), 4);
   });
 
   it('rejects malformed indices before any backend request', async () => {
@@ -495,7 +506,7 @@ describe('27. One-click sign-in through the plugin', () => {
 
   it('offers one-click setup first and keeps the custom-backend method', async () => {
     const plugin = await GeminiWebPlugin({});
-    assert.deepEqual(plugin.auth.methods.map(m => m.type), ['oauth', 'api', 'oauth']);
+    assert.deepEqual(plugin.auth.methods.map(m => m.type), ['oauth', 'oauth', 'api', 'oauth']);
   });
 
   it('blocks a reused live legacy backend before changing its pool, and permits login after its upgrade', async () => {
@@ -594,7 +605,7 @@ describe('27. One-click sign-in through the plugin', () => {
       return new Response(init.headers.Cookie === 'SID=pool-a' ? '{"oPEP7c":"pool-a@gmail.com"}' : '<html></html>');
     };
     try {
-      const method = (await GeminiWebPlugin({})).auth.methods[2];
+      const method = (await GeminiWebPlugin({})).auth.methods.find(m => m.label === '添加本地后端里已有的 Google 账号');
       // The picker is ask()'s: a declared select would need the pool at load time, and a host
       // refuses a declared select without options.
       assert.deepEqual(method.prompts, []);

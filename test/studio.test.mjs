@@ -190,7 +190,7 @@ describe('AI Studio Plugin & Models Unit Tests', () => {
 
     await web.config(cfg);
     assert.ok(cfg.provider['gemini-web']);
-    assert.equal(cfg.provider['gemini-web'].name, 'Gemini Web');
+    assert.equal(cfg.provider['gemini-web'].name, 'Gemini-web-all · zp');
 
     await studio.config(cfg);
     assert.ok(cfg.provider['gemini-web'], 'Web provider must still be present');

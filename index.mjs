@@ -6,6 +6,7 @@ import { usage, poolChoices, poolAccounts, accountEmail } from './lib/usage.mjs'
 import { isContainerEnv, dockerProxyHint } from './lib/proc.mjs';
 
 const ID = 'gemini-web';
+const PROVIDER_NAME = 'Gemini-web-all · zp';
 const GEMINI_URL = 'https://gemini.google.com/app';
 
 // Saved macOS Task sign-ins predate removal of the native bridge. Reject them here so their
@@ -117,6 +118,23 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
     }
   };
 
+  // Paste the export itself rather than a callback code: whoever already has the cookies should
+  // not have to open the browser again. Host inputs are one line, so lib/setup.mjs salvages a
+  // flattened Cookie-Editor / EditThisCookie export.
+  const cookiePrompt = {
+    type: 'text',
+    key: 'cookie',
+    message: 'Cookie（粘贴 Cookie-Editor / EditThisCookie 导出的整份 JSON，或 gemini.google.com 请求头里 cookie 一行的值）',
+    placeholder: 'SID=…; HSID=…; __Secure-1PSID=…',
+    validate: value => {
+      try {
+        parseCookieInput(value);
+      } catch (e) {
+        return e.message;
+      }
+    }
+  };
+
   // Bring a backend set up earlier back after Magpie or the computer restarts. Not awaited:
   // requests that arrive first start it themselves through forwardManaged.
   if (localBackend()) {
@@ -132,9 +150,14 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
   return {
     config: async cfg => {
       cfg.provider ??= {};
-      cfg.provider[ID] ??= { name: 'Gemini-web-all · zp', npm: '@ai-sdk/openai-compatible', api: opts.baseURL, models: {} };
-      // Named after the fork's owner so it can be told apart from upstream's own gemini-web.
-      cfg.provider[ID].name = 'Gemini-web-all · zp';
+      const existing = cfg.provider[ID];
+      cfg.provider[ID] ??= { name: PROVIDER_NAME, npm: '@ai-sdk/openai-compatible', api: opts.baseURL, models: {} };
+      // Named after the fork's owner so it can be told apart from upstream's own gemini-web. A
+      // name the user set themselves stays theirs; ours covers a fresh entry, an entry this fork
+      // created earlier, and the 'Gemini Web' default of releases before the rename.
+      if (!existing || !existing.name || existing.name === 'Gemini Web' || existing.name === PROVIDER_NAME) {
+        cfg.provider[ID].name = PROVIDER_NAME;
+      }
     },
     auth: {
       provider: ID,
@@ -182,6 +205,31 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
               return signInFor(local, account || { id: added.id });
             }
           };
+        }
+      }, {
+        type: 'oauth',
+        label: '粘贴 Cookie 直接登录（Cookie-Editor 导出整份粘贴即可）',
+        prompts: [cookiePrompt, proxyPrompt, authuserPrompt],
+        ask(inputs) {
+          if (!inputs || !('cookie' in inputs)) return cookiePrompt;
+          if (!('proxy' in inputs)) return proxyPrompt;
+          return 'authuser' in inputs ? null : authuserPrompt;
+        },
+        // Everything the one-click method asks for in a callback, answered up front: import the
+        // cookie into the backend's pool, let the backend check it against Gemini, sign in.
+        async authorize(inputs) {
+          const proxy = validateProxyURL(inputs?.proxy || opts.proxy || '');
+          const authuser = parseAuthuser(inputs?.authuser);
+          const cookie = parseCookieInput(inputs?.cookie);
+          try {
+            const local = await ensureBackend({ proxy });
+            const added = await importCookie(local, cookie, { authuser, ...(proxy ? { proxy } : {}) });
+            const account = (await poolAccounts().catch(() => [])).find(a => a.id === added.id);
+            return signInFor(local, account || { id: added.id });
+          } catch (err) {
+            const hint = dockerProxyHint(proxy);
+            throw new Error(hint ? `${err.message}\n${hint}` : err.message);
+          }
         }
       }, {
         type: 'api',

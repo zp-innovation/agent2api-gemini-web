@@ -41,6 +41,19 @@ describe('declared login methods', () => {
     });
   }
 
+  it('declares a cookie-paste sign-in that needs no callback dialog', async () => {
+    const methods = (await GeminiWebPlugin({})).auth.methods;
+    const cookie = methods.find(m => m.label.startsWith('粘贴 Cookie 直接登录'));
+    assert.ok(cookie, 'GeminiWebPlugin lost its cookie-paste sign-in');
+    assert.deepEqual(cookie.prompts.map(p => p.key), ['cookie', 'proxy', 'authuser']);
+    assert.ok(cookie.prompts.every(p => p.type === 'text'));
+    assert.equal(cookie.ask({}), cookie.prompts[0], 'the cookie question comes first');
+    assert.equal(cookie.ask({ cookie: 'x' }), cookie.prompts[1]);
+    assert.equal(cookie.ask({ cookie: 'x', proxy: '' }), cookie.prompts[2]);
+    assert.equal(cookie.ask({ cookie: 'x', proxy: '', authuser: '0' }), null);
+    assert.match(cookie.prompts[2].validate('[{"name":"SID","value":"x","domain":".google.com"}]'), /这里只填 Google 账号索引的数字/);
+  });
+
   it('asks for the Google account through ask(), not through a declared select', async () => {
     const web = (await GeminiWebPlugin({})).auth.methods.find(m => m.label === '添加本地后端里已有的 Google 账号');
     assert.ok(web, 'GeminiWebPlugin lost its account method');
