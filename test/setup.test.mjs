@@ -195,6 +195,8 @@ describe('25. Cookie import through the admin API', () => {
         return Response.json({ ok: true });
       }
       if (pathname === '/admin/api/cookies' && init.method === 'POST') return Response.json({ id: 7 });
+      if (pathname === '/admin/api/cookies/7' && init.method === 'PATCH') return Response.json({ ok: true });
+      if (pathname === '/admin/api/cookies' && init.method === 'GET') return Response.json({ items: [{ id: 7, proxy_id: 3 }] });
       if (pathname === '/admin/api/cookies/7/check') return Response.json({ ok: true, detail: 'via proxy' });
       return Response.json({ ok: true });
     };
@@ -206,9 +208,12 @@ describe('25. Cookie import through the admin API', () => {
       'GET /admin/api/proxies',
       'POST /admin/api/proxies',
       'POST /admin/api/cookies',
+      'PATCH /admin/api/cookies/7',
+      'GET /admin/api/cookies',
       'POST /admin/api/cookies/7/check'
     ]);
-    assert.equal(calls.find(c => c.path === '/admin/api/cookies').body.proxy_id, 3, 'account must be bound to the chosen proxy before check');
+    assert.equal(calls.find(c => c.path === '/admin/api/cookies' && c.method === 'POST').body.proxy_id, 3, 'account must be bound to the chosen proxy before check');
+    assert.equal(calls.find(c => c.method === 'PATCH').body.proxy_id, 3, 'upstream builds only take the binding on PATCH');
 
     // Updating the Magpie proxy URL and resetting failures reuses the existing pool row in-place.
     calls.length = 0;
@@ -225,9 +230,28 @@ describe('25. Cookie import through the admin API', () => {
     assert.equal(proxies[0].fail_count, 0);
   });
 
-  it('rejects legacy, upstream and unadvertised builds before sending cookies or changing proxies', async () => {
+  it('removes the account when the backend accepts the request but records no proxy binding', async () => {
+    const calls = [];
+    const fetchFn = async (url, init) => {
+      const pathname = new URL(url).pathname;
+      calls.push(`${init.method} ${pathname}`);
+      if (pathname === '/') return Response.json({ version: '4.33.0' });
+      if (pathname === '/admin/api/proxies' && init.method === 'GET') return Response.json({ items: [] });
+      if (pathname === '/admin/api/proxies' && init.method === 'POST') return Response.json({ id: 3 });
+      if (pathname === '/admin/api/cookies' && init.method === 'POST') return Response.json({ id: 7 });
+      if (pathname === '/admin/api/cookies' && init.method === 'GET') return Response.json({ items: [{ id: 7, proxy_id: 0 }] });
+      return Response.json({ ok: true });
+    };
+    await assert.rejects(
+      importCookie(setup, SIGNED_IN, { proxy: 'http://127.0.0.1:7890', fetchFn }),
+      /不支持登录时绑定代理/
+    );
+    assert.equal(calls.at(-1), 'DELETE /admin/api/cookies/7');
+  });
+
+  it('rejects builds that cannot bind a proxy before sending cookies or changing proxies', async () => {
     for (const info of [
-      { version: '4.22.0-magpie.1' }, { version: '4.26.0' },
+      { version: '4.22.0-magpie.1' }, { version: '4.26.0' }, { version: '4.31.0-magpie.2' },
       { version: '4.26.0-magpie.1' }, { capabilities: { account_proxy_binding: 'true' } }
     ]) {
       const calls = [];
@@ -259,6 +283,9 @@ describe('25. Cookie import through the admin API', () => {
 describe('26. ensureBackend', () => {
   it('leaves a backend that already answers with this key alone', async () => {
     const dataDir = makeDataDir();
+    // The pin check only replaces binaries whose hash is not trusted; a build this data dir
+    // already trusts must be left alone.
+    trustBinary(dataDir);
     const spawned = [];
     const setup = await ensureBackend({
       dataDir,
@@ -446,6 +473,10 @@ describe('27. One-click sign-in through the plugin', () => {
           db.prepare('INSERT INTO proxies (id, name, url, enabled) VALUES (?, ?, ?, 1)').run(id, parsed.name, parsed.url);
           return send(200, { id });
         }
+        if (req.method === 'GET' && req.url === '/admin/api/cookies') {
+          const items = db.prepare('SELECT id, proxy_id FROM accounts ORDER BY id').all();
+          return send(200, { items, total: items.length, enabled: items.length });
+        }
         if (req.method === 'POST' && req.url === '/admin/api/cookies') {
           const parsed = JSON.parse(body);
           const id = nextId++;
@@ -456,6 +487,15 @@ describe('27. One-click sign-in through the plugin', () => {
           return send(200, { id });
         }
         const m = req.url.match(/^\/admin\/api\/cookies\/(\d+)(\/check)?$/);
+        if (m && req.method === 'PATCH' && !m[2]) {
+          const parsed = JSON.parse(body);
+          if (Number.isInteger(parsed.proxy_id)) {
+            db.prepare('UPDATE accounts SET proxy_id = ? WHERE id = ?').run(parsed.proxy_id, Number(m[1]));
+            const entry = accounts.get(Number(m[1]));
+            if (entry) entry.proxyId = parsed.proxy_id;
+          }
+          return send(200, { ok: true });
+        }
         if (m && req.method === 'POST' && m[2]) {
           const entry = accounts.get(Number(m[1]));
           const cookie = entry?.cookie || '';

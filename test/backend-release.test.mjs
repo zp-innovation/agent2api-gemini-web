@@ -30,14 +30,39 @@ it('ships pinned optimized and rollback downloads for all six supported targets'
     const [platform, arch] = key.split('-');
     const optimized = pinnedBinary(platform, arch);
     const upstream = pinnedBinary(platform, arch, 'upstream');
-    assert.match(optimized.url, /^https:\/\/github\.com\/BUKOWSKIREAL\/magpie-gemini-web\/releases\/download\/backend-v4\.31\.0-magpie\.2\//);
+    assert.match(optimized.url, /^https:\/\/github\.com\/zexadev\/gemini-web2api-go\/releases\/download\/v4\.33\.0\//);
     assert.match(optimized.sha256, /^[a-f0-9]{64}$/);
-    assert.match(upstream.url, /^https:\/\/github\.com\/zexadev\/gemini-web2api-go\/releases\/download\/v4\.31\.0\//);
-    assert.notEqual(optimized.sha256, upstream.sha256);
+    // The optimized magpie build stopped at 4.31.0, which predates the OSID requirement, so the
+    // pinned channel now names the same upstream build the rollback channel does.
+    assert.equal(upstream.url, optimized.url);
+    assert.equal(upstream.sha256, optimized.sha256);
     assert.equal(optimized.url.endsWith('.exe'), platform === 'win32');
   }
   assert.throws(() => pinnedBinary('linux', 'mips'), /No gemini-web2api-go/);
   assert.throws(() => pinnedBinary('linux', 'x64', 'unknown'), /Invalid backend channel/);
+});
+
+it('replaces a backend that still answers when the pin moves on', async t => {
+  const dataDir = fixture(t);
+  const old = Buffer.from('old pinned build');
+  const next = Buffer.from('new pinned build');
+  pinFixture(t, PINNED_BINARIES, old);
+  const bin = binaryPath(dataDir, 'darwin');
+  fs.writeFileSync(bin, old);
+  pinFixture(t, PINNED_BINARIES, next);
+  const calls = [];
+  let spawned = false;
+  await ensureBackend({ dataDir, platform: 'darwin', arch: 'arm64',
+    fetchFn: async url => {
+      calls.push(url);
+      if (url === pinnedBinary('darwin', 'arm64').url) return new Response(next);
+      return Response.json({ data: [] });
+    },
+    spawnFn: () => { spawned = true; return { pid: 1234, on() {}, unref() {} }; }
+  });
+  assert.deepEqual(fs.readFileSync(bin), next);
+  assert.ok(calls.includes(pinnedBinary('darwin', 'arm64').url));
+  assert.ok(spawned);
 });
 
 it('upgrades a stopped upstream backend to the optimized release without changing account data', async t => {
