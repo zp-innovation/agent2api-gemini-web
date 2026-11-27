@@ -1,7 +1,7 @@
 import { normalizeBaseURL, settings, credentials, listModels, forward, UNREACHABLE_HEADER, PLUGIN_ICON } from './lib/backend.mjs';
 import { ensureBackend, localBackend, localSetup } from './lib/native.mjs';
 import { registerMagpieCleanup, isPluginRemovedInActiveMagpie } from './lib/cleanup.mjs';
-import { parseCookieInput, parseAuthuser, importCookie, ensureProxy, validateProxyURL, requireLoginBackend } from './lib/setup.mjs';
+import { parseCookieInput, parseSignInPaste, parseAuthuser, importCookie, ensureProxy, validateProxyURL, requireLoginBackend, dynamicAskPrompts, apiKeyPrompt, extractApiKey } from './lib/setup.mjs';
 import { usage, poolChoices, poolAccounts, accountEmail } from './lib/usage.mjs';
 import { isContainerEnv, dockerProxyHint } from './lib/proc.mjs';
 
@@ -22,16 +22,24 @@ function retiredTaskError() {
 // The backend keeps the session alive by rotating its cookies, which signs the browser it came
 // from out of Google. A private window that is closed afterwards gives the backend a session of
 // its own.
+const ASKED_INDEX_STEP = '确认这个窗口的目标账号索引与刚才填写的一致；无痕窗口中的索引可能和普通窗口不同。如地址是 /u/4/app，应填 4；填错请取消并重新登录。';
+const QUICK_INDEX_STEP = '多账号请把 cookie 和地址栏里的索引一起粘贴，例如地址是 /u/4/app 时粘贴 {"cookie":"…","authuser":4}；只粘贴 cookie 原文则按 0。无痕窗口中的索引可能和普通窗口不同。';
+const RAW_PASTE_STEP = '4. 找到 cookie 那一行，复制它的值，粘贴到下面';
+const QUICK_PASTE_STEP = '4. 找到 cookie 那一行并复制它的值。单账号直接粘贴该值；多账号粘贴 {"cookie":"<该值>","authuser":N}';
+
 const COOKIE_STEPS = [
   '请用浏览器的无痕 / 隐私窗口（推荐 Firefox），不要用你平时登录着 Google 的窗口：后端会定时刷新这份登录，和浏览器共用会被 Google 踢出登录。',
   `1. 在无痕窗口打开 ${GEMINI_URL} 并登录要使用的 Google 账号`,
-  '确认这个窗口的目标账号索引与刚才填写的一致；无痕窗口中的索引可能和普通窗口不同。如地址是 /u/4/app，应填 4；填错请取消并重新登录。',
+  ASKED_INDEX_STEP,
   '2. 按 F12（macOS 按 ⌥⌘I）打开开发者工具，切到 Network（网络）面板，刷新页面',
   '3. 点列表里任意一个 gemini.google.com 的请求 → Headers（标头）→ Request Headers（请求标头）',
-  '4. 找到 cookie 那一行，复制它的值，粘贴到下面',
+  RAW_PASTE_STEP,
   '5. 直接关掉无痕窗口，不要点「退出登录」（退出会让这份 Cookie 失效）',
   'Cookie 只保存在本机的 Gemini Web 后端里，不会发到别处。'
 ].join('\n');
+
+// quickSignIn never asked for an index, so these steps must not refer to one the user typed.
+const QUICK_COOKIE_STEPS = COOKIE_STEPS.replace(ASKED_INDEX_STEP, QUICK_INDEX_STEP).replace(RAW_PASTE_STEP, QUICK_PASTE_STEP);
 
 // signInFor is the Magpie sign-in for one account of the local backend's pool: the backend's
 // key, with the account's id for its usage card and its Google email, which names the card and
@@ -231,8 +239,11 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
       methods: [{
         type: 'oauth',
         label: '一键配置本地 Gemini Web（推荐）',
-        prompts: [proxyPrompt, authuserPrompt],
+        // quickSignIn asks nothing before the cookie: the proxy comes from the options, the
+        // environment or the pool, and the account index from the paste (else 0).
+        prompts: opts.quickSignIn ? [] : [proxyPrompt, authuserPrompt],
         ask(inputs) {
+          if (opts.quickSignIn) return null;
           if (!inputs || !('proxy' in inputs)) return proxyPrompt;
           return 'authuser' in inputs ? null : authuserPrompt;
         },
@@ -243,27 +254,35 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
         // one for each Google account (see signInFor).
         async authorize(inputs) {
           const proxy = validateProxyURL(inputs?.proxy || opts.proxy || '');
-          const authuser = parseAuthuser(inputs?.authuser);
-          const loginURL = authuser ? `https://gemini.google.com/u/${authuser}/app` : GEMINI_URL;
+          const answered = inputs?.authuser !== undefined && inputs?.authuser !== null && String(inputs.authuser).trim() !== '';
+          const asked = parseAuthuser(inputs?.authuser);
+          const loginURL = asked ? `https://gemini.google.com/u/${asked}/app` : GEMINI_URL;
           const ready = ensureBackend({ proxy });
           ready.catch(() => {});
           const proxyHint = dockerProxyHint(proxy);
           return {
-            url: loginURL,
+            // An empty url keeps Magpie from opening a browser (openBrowser: false).
+            url: opts.openBrowser ? loginURL : '',
             method: 'code',
-            instructions: COOKIE_STEPS.replaceAll(GEMINI_URL, loginURL) + (proxyHint ? `\n\n注意：${proxyHint}` : ''),
+            instructions: (opts.quickSignIn ? QUICK_COOKIE_STEPS : COOKIE_STEPS).replaceAll(GEMINI_URL, loginURL) + (proxyHint ? `\n\n注意：${proxyHint}` : ''),
             async callback(code) {
-              let local, cookie, added;
+              let local, pasted, added, authuser = asked;
               try {
-                cookie = parseCookieInput(code);
+                pasted = parseSignInPaste(code);
+                if (pasted.authuser !== undefined) {
+                  if (answered && pasted.authuser !== asked) {
+                    throw new Error(`粘贴内容里的账号索引是 ${pasted.authuser}，和刚才填写的 ${asked} 不一致：请确认复制 Cookie 的窗口后重新登录`);
+                  }
+                  authuser = pasted.authuser;
+                }
                 local = await ready;
-                added = await importCookie(local, cookie, { authuser, ...(proxy ? { proxy } : {}) });
+                added = await importCookie(local, pasted.cookie, { authuser, ...(proxy ? { proxy } : {}) });
               } catch (err) {
                 const hint = dockerProxyHint(proxy);
                 return { type: 'failed', error: hint ? `${err.message}\n${hint}` : err.message };
               }
               const account = (await poolAccounts().catch(() => [])).find(a => a.id === added.id);
-              return signInFor(local, account || { id: added.id }, { cookie, proxy });
+              return signInFor(local, account || { id: added.id }, { cookie: pasted.cookie, proxy });
             }
           };
         }
@@ -308,20 +327,29 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
               return e.message;
             }
           }
-        }],
+        }, apiKeyPrompt('Backend API key', 'Backend API key (not a Google cookie)')],
         // Magpie stores raw prompt inputs as metadata unless authorize returns its own;
         // write the resolved URL so a blank answer doesn't persist as baseURL: "".
-        authorize: async inputs => ({
-          type: 'success',
-          metadata: { baseURL: normalizeBaseURL(inputs?.baseURL || opts.baseURL) }
-        })
+        // A host that still collects the key itself omits `key`; return metadata only then.
+        authorize: async inputs => {
+          let key;
+          try {
+            key = extractApiKey(inputs);
+          } catch (err) {
+            return { type: 'failed', error: err.message };
+          }
+          return {
+            type: 'success',
+            ...(key === undefined ? {} : { key }),
+            metadata: { baseURL: normalizeBaseURL(inputs?.baseURL || opts.baseURL) }
+          };
+        }
       }, {
         type: 'oauth',
         label: '添加本地后端里已有的 Google 账号',
-        // The picker is ask()'s alone. A host reads declared prompts before it calls ask(), and
-        // one rejects the whole login list over a declared select with no options (the pool only
-        // exists at sign-in time), so declaring the question here would break provider setup.
-        prompts: [],
+        // ask() lists the pool as it is now. The static prompt only keeps prompts non-empty
+        // for Magpie, and does not share the account key Agent2API would then drop.
+        prompts: dynamicAskPrompts(_input, '选择 Google 账号'),
         async ask(inputs) {
           if (inputs?.account) return null;
           if (!localBackend()) throw new Error('还没有本地后端：请先用「一键配置本地 Gemini Web」');

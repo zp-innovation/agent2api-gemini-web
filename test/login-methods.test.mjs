@@ -6,7 +6,8 @@ import { GeminiWebPlugin, AIStudioPlugin } from '../index.mjs';
 // declared select without options refuses the provider's whole login list (agent2api answers
 // 502 插件登录选择字段没有可用选项, which Magpie's setup card shows as 无法读取登录方式). A live
 // account pool cannot be declared ahead of time, so a picker that depends on runtime state
-// belongs to ask(); any select declared here must already carry real options.
+// belongs to ask(); any select declared here must already carry real options. Passwords are the
+// key a backend hands out (see apiKeyPrompt in lib/setup.mjs).
 const PLUGINS = [
   ['GeminiWebPlugin', () => GeminiWebPlugin({})],
   ['AIStudioPlugin', () => AIStudioPlugin()]
@@ -22,7 +23,7 @@ describe('declared login methods', () => {
         assert.ok(['oauth', 'api'].includes(method.type), `${where}: unexpected type ${method.type}`);
         const keys = [];
         for (const prompt of method.prompts ?? []) {
-          assert.ok(['text', 'select'].includes(prompt.type), `${where}: prompt type ${prompt.type}`);
+          assert.ok(['text', 'select', 'password'].includes(prompt.type), `${where}: prompt type ${prompt.type}`);
           assert.equal(typeof prompt.key, 'string', `${where}: prompt without a key`);
           assert.ok(prompt.key.length > 0, `${where}: prompt with an empty key`);
           keys.push(prompt.key);
@@ -57,7 +58,14 @@ describe('declared login methods', () => {
   it('asks for the Google account through ask(), not through a declared select', async () => {
     const web = (await GeminiWebPlugin({})).auth.methods.find(m => m.label === '添加本地后端里已有的 Google 账号');
     assert.ok(web, 'GeminiWebPlugin lost its account method');
-    assert.deepEqual(web.prompts, []);
+    // Magpie forwards inputs only when a method declares a prompt, so it keeps one field that is
+    // never shown (see dynamicAskPrompts); it must not be a picker.
+    assert.deepEqual((web.prompts ?? []).filter(p => p.type === 'select'), []);
+    assert.ok((web.prompts ?? []).every(p => typeof p.condition === 'function' && p.condition() === false),
+      'the account method declares a prompt a host would show');
+    const hosted = (await GeminiWebPlugin({ project: { id: 'agent2api' } })).auth.methods
+      .find(m => m.label === '添加本地后端里已有的 Google 账号');
+    assert.deepEqual(hosted.prompts, [], 'Agent2API reads the account from ask()');
     assert.equal(typeof web.ask, 'function');
     assert.equal(typeof web.authorize, 'function');
     const studio = (await AIStudioPlugin()).auth.methods;
