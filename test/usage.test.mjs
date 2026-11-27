@@ -359,9 +359,17 @@ describe('28. Gemini usage limits', () => {
     assert.match(out.user, /@gmail\.com$/);
     assert.deepEqual(out.windows.map(w => w.used), [40, 20]);
 
-    // Two accounts left: which one the sign-in meant is unknowable, so the card names them.
-    const two = async () => [{ id: 92, cookie: 'a', pooled: 0 }, { id: 93, cookie: 'b', pooled: 0 }];
-    assert.match((await usage({ poolAccounts: two, fetchFn, account: 3 })).error, /现在启用的是 #92、#93/);
+    // Two accounts left: the sign-in's email picks it out among them.
+    const two = async () => [{ id: 92, cookie: 'stale-a', pooled: 0 }, { id: 93, cookie: 'stale-b', pooled: 0 }];
+    const both = fakeFetch({ 'stale-a': reply(0.4, 0.2), 'stale-b': reply(0.7, 0.6) }, [],
+      { 'stale-a': 'jack@gmail.com', 'stale-b': 'other@gmail.com' });
+    const picked = await usage({ poolAccounts: two, fetchFn: both, account: 3, email: 'jack@gmail.com' });
+    assert.equal(picked.user, 'jack@gmail.com');
+    assert.deepEqual(picked.windows.map(w => w.used), [40, 20]);
+
+    // No account carries that email: the card names the ones there are instead of guessing.
+    const stranger = await usage({ poolAccounts: two, fetchFn: both, account: 3, email: 'gone@gmail.com' });
+    assert.match(stranger.error, /现在启用的是 #92、#93/);
   });
 
   it('reads enabled accounts, their proxy and whether the pool has any from the backend database', async () => {
