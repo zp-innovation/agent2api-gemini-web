@@ -132,7 +132,9 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
   return {
     config: async cfg => {
       cfg.provider ??= {};
-      cfg.provider[ID] ??= { name: 'Gemini Web', npm: '@ai-sdk/openai-compatible', api: opts.baseURL, models: {} };
+      cfg.provider[ID] ??= { name: 'Gemini-web-all · zp', npm: '@ai-sdk/openai-compatible', api: opts.baseURL, models: {} };
+      // Named after the fork's owner so it can be told apart from upstream's own gemini-web.
+      cfg.provider[ID].name = 'Gemini-web-all · zp';
     },
     auth: {
       provider: ID,
