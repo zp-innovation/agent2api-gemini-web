@@ -100,6 +100,16 @@ async function managedSignIn(auth, opts) {
 const HEAL_TTL_MS = 60 * 1000;
 const healedAt = new Map();
 
+// A pool entry is named by the cookie it holds: the backend rotates the short-lived parts
+// (1PSIDTS, SIDCC) but not the sign-in's own __Secure-1PSID, so the copy in the credential still
+// names the entry the pool keeps. Without this the id the sign-in saved is the only link, and a
+// pool that renumbered — or that now gives that id to another Google account — makes every heal
+// import the same cookie again, one copy a minute.
+function cookieFingerprint(cookie) {
+  const m = /(?:^|;\s*)__Secure-1PSID=([^;]+)/.exec(cookie || '') || /(?:^|;\s*)SID=([^;]+)/.exec(cookie || '');
+  return m ? m[1] : null;
+}
+
 async function healManaged(local, auth) {
   const meta = auth?.metadata || {};
   const key = `${local.baseURL}|${meta.account}|${meta.email || ''}`;
@@ -116,6 +126,9 @@ async function healManaged(local, auth) {
   }
   healedAt.set(key, Date.now());
   if (found) return found;
+  const mine = cookieFingerprint(meta.cookie);
+  const held = mine ? pool.find(a => cookieFingerprint(a.cookie) === mine) : null;
+  if (held) return held;
   if (!meta.cookie) return null;
   const added = await importCookie(local, parseCookieInput(meta.cookie), {
     ...(meta.authuser > 0 ? { authuser: meta.authuser } : {}),

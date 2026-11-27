@@ -16,6 +16,10 @@ const LOGIN_CAPABILITIES = { capabilities: { account_proxy_binding: true } };
 
 const SIGNED_IN = REQUIRED_COOKIES.map(n => `${n}=v-${n}`).join('; ');
 
+// Each Google account carries its own __Secure-1PSID, and the pool is matched by it: a fixture that
+// reused one value would make two tests look like the same account.
+const signedInAs = tag => `${SIGNED_IN.replace('v-__Secure-1PSID', `v-__Secure-1PSID-${tag}`)}; NID=${tag}`;
+
 function makeDataDir({ port = 8083, binary = 'fake backend', platform = 'darwin' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'magpie-gemini-web-setup-'));
   fs.mkdirSync(path.join(dir, 'bin'));
@@ -973,7 +977,7 @@ describe('29. A host update that takes the backend', () => {
 
   it('signs in with the key the rebuilt backend comes back with', async () => {
     const plugin = await GeminiWebPlugin({});
-    const cookie = `${SIGNED_IN}; NID=loader`;
+    const cookie = signedInAs('loader');
     const loaded = await plugin.auth.loader(signIn({ account: 7, email: 'loader@gmail.com', cookie }));
     assert.equal(loaded.apiKey, 'gw_test');
     assert.equal(loaded.baseURL, `http://127.0.0.1:${server.address().port}/v1`);
@@ -983,7 +987,7 @@ describe('29. A host update that takes the backend', () => {
 
   it('reads the card of an account the emptied pool no longer has', async () => {
     const plugin = await GeminiWebPlugin({});
-    const cookie = `${SIGNED_IN}; NID=usage`;
+    const cookie = signedInAs('usage');
     const realFetch = globalThis.fetch;
     globalThis.fetch = (url, init) => {
       const target = String(url);
@@ -1011,7 +1015,7 @@ describe('29. A host update that takes the backend', () => {
     db.prepare("INSERT INTO accounts (id, label, cookie, status, proxy_id, authuser) VALUES (3, 'someone', 'SID=someone-else', 'enabled', 0, 0)").run();
     accounts.set(3, { cookie: 'SID=someone-else' });
     const plugin = await GeminiWebPlugin({});
-    const cookie = `${SIGNED_IN}; NID=mine`;
+    const cookie = signedInAs('mine');
     const realFetch = globalThis.fetch;
     globalThis.fetch = (url, init) => {
       const target = String(url);
@@ -1037,6 +1041,33 @@ describe('29. A host update that takes the backend', () => {
       globalThis.fetch = realFetch;
     }
     assert.equal(accounts.size, 4, 'the sign-in\'s own account was imported beside the one holding its old id');
+  });
+
+  it('reuses the pool entry that already holds the sign-in cookie', async () => {
+    // A host update can leave the sign-in naming an id the pool no longer has while the pool still
+    // holds that account under another id; importing on every heal would leave one copy a minute.
+    const cookie = signedInAs('reused');
+    db.prepare("INSERT INTO accounts (id, label, cookie, status, proxy_id, authuser) VALUES (4, 'reused', ?, 'enabled', 0, 0)").run(cookie);
+    const plugin = await GeminiWebPlugin({});
+    const before = accounts.size;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (url, init) => {
+      const target = String(url);
+      if (target === 'https://gemini.google.com/app') {
+        return Promise.resolve(new Response('<script>window.WIZ_global_data = {"oPEP7c":"reused@gmail.com"};</script>'));
+      }
+      if (target.startsWith('https://gemini.google.com/')) return Promise.resolve(new Response(reply(0.4, 0.2)));
+      return realFetch(url, init);
+    };
+    try {
+      const out = await plugin.auth.usage(signIn({ account: 9, email: 'reused@gmail.com', cookie }));
+      assert.equal(out.error, undefined);
+      assert.equal(out.user, 'reused@gmail.com');
+      assert.deepEqual(out.credits.map(c => c.remainingPercent), [60, 80], 'the pool\'s own entry was read');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(accounts.size, before, 'the pool already held this cookie, so no copy was imported');
   });
 
   it('leaves a backend the plugin did not set up alone', async () => {
