@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { GeminiWebPlugin } from '../index.mjs';
-import { parseUsage, windowsOf, accountUsage, accountEmail, poolAccounts, usage } from '../lib/usage.mjs';
+import { parseUsage, windowsOf, creditsOf, accountUsage, accountEmail, poolAccounts, usage } from '../lib/usage.mjs';
 
 // A reply the Usage page's query gets, cut to what the plugin reads.
 function reply(five, week) {
@@ -143,14 +143,14 @@ describe('28. Gemini usage limits', () => {
     const answers = { c31: reply(0, 0.31) };
     const fetchFn = fakeFetch(answers, calls, { c31: 'r@gmail.com' });
     const pool = async () => [{ id: 31, cookie: 'c31', pooled: 0 }];
-    const fiveHours = async () => (await usage({ poolAccounts: pool, fetchFn })).windows[0].used;
-    assert.equal(await fiveHours(), 0);
+    const fiveHours = async () => (await usage({ poolAccounts: pool, fetchFn })).credits[0].remainingPercent;
+    assert.equal(await fiveHours(), 100);
 
     // 30% of the 5 hours used in the Gemini app, which the backend never sees: Magpie's own
     // next ask, a minute and more later, reads it.
     answers.c31 = reply(0.3, 0.32);
     t.mock.timers.tick(65 * 1000);
-    assert.equal(await fiveHours(), 30);
+    assert.equal(await fiveHours(), 70);
 
     // More used: a refresh pressed before Magpie asks again on its own reads that too.
     answers.c31 = reply(0.5, 0.34);
@@ -225,7 +225,7 @@ describe('28. Gemini usage limits', () => {
     assert.match((await usage({ poolAccounts: pool, fetchFn })).error, /HTTP 429/);
     // Asked again within the minute, half a minute after it failed: tried again.
     t.mock.timers.tick(20 * 1000);
-    assert.equal((await usage({ poolAccounts: pool, fetchFn })).windows[0].used, 20);
+    assert.equal((await usage({ poolAccounts: pool, fetchFn })).credits[0].remainingPercent, 80);
     assert.equal(reads(), 2);
   });
 
@@ -277,11 +277,16 @@ describe('28. Gemini usage limits', () => {
     const poolAccounts = async () => [{ id: 61, cookie: 'c61', authuser, pooled: 0 }];
     const read = () => usage({ poolAccounts, fetchFn, freshMs: 60000 });
 
-    assert.deepEqual(await read(), { user: 'zero@gmail.com', windows: windowsOf(parseUsage(reply(0.1, 0)).pools) });
+    const first = await read();
+    assert.equal(first.user, 'zero@gmail.com');
+    assert.deepEqual(first.credits, creditsOf(windowsOf(parseUsage(reply(0.1, 0)).pools)));
+    assert.equal(first.available, 90);
+    assert.equal(first.unit, '%');
+    assert.equal('windows' in first, false);
     authuser = 1; // changed in the backend's panel
     const out = await read();
     assert.equal(out.user, 'one@gmail.com');
-    assert.equal(out.windows[0].used, 60);
+    assert.equal(out.credits[0].remainingPercent, 40);
     assert.equal(calls.length, 4);
 
     // A sign-in's email is for the index it was made at: it names the card only while that holds.
@@ -306,9 +311,10 @@ describe('28. Gemini usage limits', () => {
     });
     assert.equal(out.user, 'five@gmail.com +2');
     assert.equal(out.error, undefined);
-    assert.deepEqual(out.windows.map(w => [w.name, w.used]), [['5 hours', 37], ['7 days', 5]]);
-    assert.equal(out.windows[0].display, '各账号已用 five 35%，#6 37%，#7 读取失败');
-    assert.equal(out.windows[1].resetsAt, '2026-10-20T23:48:06.036Z');
+    assert.deepEqual(out.credits.map(c => [c.name, c.remainingPercent]), [['5 小时窗口', 63], ['7 天窗口', 95]]);
+    assert.equal(out.available, 63);
+    assert.equal(out.credits[0].grantReason, '各账号已用 five 35%，#6 37%，#7 读取失败');
+    assert.equal(out.credits[1].resetAt, Date.parse('2026-10-20T23:48:06.036Z'));
   });
 
   it('takes the soonest reset among equally used accounts', async () => {
@@ -317,12 +323,24 @@ describe('28. Gemini usage limits', () => {
       poolAccounts: async () => [{ id: 11, cookie: 'a', pooled: 0 }, { id: 12, cookie: 'b', pooled: 0 }],
       fetchFn: fakeFetch({ a: later, b: reply(0.5, 0.1) })
     });
-    assert.equal(out.windows[0].resetsAt, '2026-10-14T11:48:06.036Z');
+    assert.equal(out.credits[0].resetAt, Date.parse('2026-10-14T11:48:06.036Z'));
+  });
+
+  it('presents the windows as the credit lines Magpie draws in its popover', () => {
+    assert.deepEqual(creditsOf(windowsOf(parseUsage(reply(0.35, 0.05)).pools)), [
+      { name: '5 小时窗口', remainingPercent: 65, rolling: true, resetAt: Date.parse('2026-10-14T11:48:06.036Z') },
+      { name: '7 天窗口', remainingPercent: 95, rolling: true, resetAt: Date.parse('2026-10-20T23:48:06.036Z') }
+    ]);
+    // A window with no reset date keeps none, a name of its own is kept, and a reading outside
+    // 0-100% is held to it rather than drawn as a bar past its end.
+    assert.deepEqual(creditsOf([{ name: '5 hours', used: 100 }]), [{ name: '5 小时窗口', remainingPercent: 0, rolling: true }]);
+    assert.deepEqual(creditsOf([{ name: 'custom', used: -20, resetsAt: 'not a date', display: 'x' }]),
+      [{ name: 'custom', remainingPercent: 100, rolling: true, grantReason: 'x' }]);
   });
 
   it('reports every account when none can be read', async () => {
     const out = await usage({ poolAccounts: async () => [{ id: 13, cookie: 'a', pooled: 0 }, { id: 14, cookie: 'b', pooled: 0 }], fetchFn: fakeFetch({ a: 302, b: 500 }) });
-    assert.deepEqual(out.windows, []);
+    assert.deepEqual(out.credits, []);
     assert.match(out.error, /#13：Cookie 已失效.*；#14：Gemini 返回 HTTP 500/);
   });
 
@@ -331,11 +349,11 @@ describe('28. Gemini usage limits', () => {
       poolAccounts: async () => [{ id: 8, cookie: 'c8', pooled: 0 }],
       fetchFn: fakeFetch({ c8: reply(0.1, 0.2) }, [], { c8: 'one@gmail.com' })
     });
-    assert.deepEqual(one.windows.map(w => w.name), ['5 hours', '7 days']);
+    assert.deepEqual(one.credits.map(c => c.name), ['5 小时窗口', '7 天窗口']);
     assert.equal(one.user, 'one@gmail.com');
 
     const dead = await usage({ poolAccounts: async () => [{ id: 9, cookie: 'c9', pooled: 0 }], fetchFn: fakeFetch({ c9: 302 }) });
-    assert.deepEqual(dead.windows, []);
+    assert.deepEqual(dead.credits, []);
     assert.match(dead.error, /Cookie 已失效/);
 
     assert.match((await usage({ poolAccounts: async () => [] })).error, /没有启用/);
@@ -347,7 +365,7 @@ describe('28. Gemini usage limits', () => {
     const fetchFn = fakeFetch({ a: reply(0.9, 0.5), b: reply(0.1, 0.2) }, [], { b: 'b@gmail.com' });
     const out = await usage({ poolAccounts: accounts, fetchFn, account: 22 });
     assert.equal(out.user, 'b@gmail.com');
-    assert.deepEqual(out.windows.map(w => [w.name, w.used, w.display]), [['5 hours', 10, undefined], ['7 days', 20, undefined]]);
+    assert.deepEqual(out.credits.map(c => [c.name, c.remainingPercent, c.grantReason]), [['5 小时窗口', 90, undefined], ['7 天窗口', 80, undefined]]);
     assert.match((await usage({ poolAccounts: accounts, fetchFn, account: 99 })).error, /已经没有这个账号（#99）/);
   });
 
@@ -357,7 +375,7 @@ describe('28. Gemini usage limits', () => {
     const out = await usage({ poolAccounts: one, fetchFn, account: 3, email: 'jack@gmail.com' });
     // The email is kept per backend id across reads, so any cached name is fine here.
     assert.match(out.user, /@gmail\.com$/);
-    assert.deepEqual(out.windows.map(w => w.used), [40, 20]);
+    assert.deepEqual(out.credits.map(c => c.remainingPercent), [60, 80]);
 
     // Two accounts left: the sign-in's email picks it out among them.
     const two = async () => [{ id: 92, cookie: 'stale-a', pooled: 0 }, { id: 93, cookie: 'stale-b', pooled: 0 }];
@@ -365,7 +383,7 @@ describe('28. Gemini usage limits', () => {
       { 'stale-a': 'jack@gmail.com', 'stale-b': 'other@gmail.com' });
     const picked = await usage({ poolAccounts: two, fetchFn: both, account: 3, email: 'jack@gmail.com' });
     assert.equal(picked.user, 'jack@gmail.com');
-    assert.deepEqual(picked.windows.map(w => w.used), [40, 20]);
+    assert.deepEqual(picked.credits.map(c => c.remainingPercent), [60, 80]);
 
     // No account carries that email: the card names the ones there are instead of guessing.
     const stranger = await usage({ poolAccounts: two, fetchFn: both, account: 3, email: 'gone@gmail.com' });
@@ -408,7 +426,7 @@ describe('28. Gemini usage limits', () => {
   it('reads no usage for a backend the plugin does not manage', async () => {
     const plugin = await GeminiWebPlugin({}, {});
     const out = await plugin.auth.usage(async () => ({ type: 'api', key: 'k', metadata: { baseURL: 'http://127.0.0.1:9/v1' } }));
-    assert.deepEqual(out.windows, []);
+    assert.deepEqual(out.credits, []);
     assert.match(out.error, /本地后端/);
     assert.equal(out.signIn, 'kept');
     assert.match((await plugin.auth.usage(async () => undefined)).error, /还没有登录/);

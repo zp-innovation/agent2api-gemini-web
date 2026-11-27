@@ -167,6 +167,10 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
       // Gemini Web can take minutes to answer (#33). The backend still caps each way out to
       // Google (per-IP limits), and Magpie's own setting on the provider goes over this.
       maxConcurrency: 2,
+      // The card reads as a credit cell (可用 97 % with a 积分明细 popover), not as the grid
+      // Magpie draws for a provider that reports several windows at once: a Gemini account has
+      // two of them and neither is the point on its own (see creditsOf in lib/usage.mjs).
+      accountFeatures: { creditDetail: true },
       methods: [{
         type: 'oauth',
         label: '一键配置本地 Gemini Web（推荐）',
@@ -306,16 +310,16 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
       // belongs to the backend, not to Google.
       async usage(getAuth) {
         const auth = await getAuth();
-        if (auth?.type !== 'api') return { error: 'Gemini Web 还没有登录', windows: [], signIn: 'kept' };
-        if (retiredTask(auth)) return { error: retiredTaskError().message, windows: [], signIn: 'expired' };
+        if (auth?.type !== 'api') return { error: 'Gemini Web 还没有登录', credits: [], signIn: 'kept' };
+        if (retiredTask(auth)) return { error: retiredTaskError().message, credits: [], signIn: 'expired' };
         let c;
         try {
           c = credentials(auth, opts);
         } catch (err) {
-          return { error: err.message, windows: [], signIn: 'kept' };
+          return { error: err.message, credits: [], signIn: 'kept' };
         }
         if (!managedBackend(c.baseURL, c.key)) {
-          return { error: '只能读取插件自己管理的本地后端的额度（连接已有后端时读不到）', windows: [], signIn: 'kept' };
+          return { error: '只能读取插件自己管理的本地后端的额度（连接已有后端时读不到）', credits: [], signIn: 'kept' };
         }
         const { account, email, authuser } = auth.metadata || {};
         return { ...(await usage(Number.isInteger(account) ? { account, email, authuser } : {})), signIn: 'kept' };

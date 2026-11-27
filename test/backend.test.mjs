@@ -1095,4 +1095,12 @@ describe('23. Plugin metadata for Magpie', () => {
     assert.equal(web.auth.maxConcurrency, 2);
     assert.equal(studio.auth.maxConcurrency, 1);
   });
+
+  it('asks Magpie to draw the Gemini Web card as credits, not as a grid of windows', async () => {
+    // The card carries one reading and a 积分明细 popover (see creditsOf in lib/usage.mjs);
+    // Magpie draws that cell only for a provider that declares credit detail.
+    const web = await GeminiWebPlugin();
+    assert.deepEqual(web.auth.accountFeatures, { creditDetail: true });
+    assert.equal((await AIStudioPlugin()).auth.accountFeatures, undefined);
+  });
 });
