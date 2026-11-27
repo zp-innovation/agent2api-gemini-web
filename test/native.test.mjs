@@ -39,6 +39,36 @@ describe('22. Setup helper hash mismatch/download failure no executable installe
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
+  it('follows the 302 GitHub answers for a release asset', async () => {
+    const dataDir = makeTempDir();
+    const content = Buffer.from('binary bytes behind a redirect');
+    const expectedHash = crypto.createHash('sha256').update(content).digest('hex');
+    const asset = 'https://release-assets.example/asset?token=1';
+    const seen = [];
+    const fakeFetch = async (url, init) => {
+      seen.push([url, init?.redirect]);
+      if (url === 'https://github.com/o/r/releases/download/t/b') {
+        return new Response(null, { status: 302, headers: { location: asset } });
+      }
+      if (url === asset) return new Response(content, { status: 200 });
+      return new Response('Not Found', { status: 404 });
+    };
+    const { binPath: installed } = await installBackend({
+      dataDir,
+      platform: 'darwin',
+      arch: 'arm64',
+      url: 'https://github.com/o/r/releases/download/t/b',
+      expectedHash,
+      fetchFn: fakeFetch
+    });
+    assert.equal(fs.existsSync(installed), true);
+    assert.deepEqual(seen, [
+      ['https://github.com/o/r/releases/download/t/b', 'manual'],
+      [asset, 'manual']
+    ]);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+
   it('aborts on SHA256 mismatch, deletes temp file and leaves no executable', async () => {
     const dataDir = makeTempDir();
     const dummyContent = Buffer.from('malicious or corrupted binary bytes');
