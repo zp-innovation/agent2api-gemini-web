@@ -913,6 +913,40 @@ describe('29. A host update that takes the backend', () => {
     assert.equal(accounts.size, 2, 'the account was put back before the read, not read from a pool that has it');
   });
 
+  it('reads its own account, not the one the pool numbers alike', async () => {
+    // A re-import numbers the pool from the start again, so an id the sign-in saved can name
+    // another Google account by now; reading that entry would show someone else's quota.
+    db.prepare("INSERT INTO accounts (id, label, cookie, status, proxy_id, authuser) VALUES (3, 'someone', 'SID=someone-else', 'enabled', 0, 0)").run();
+    accounts.set(3, { cookie: 'SID=someone-else' });
+    const plugin = await GeminiWebPlugin({});
+    const cookie = `${SIGNED_IN}; NID=mine`;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (url, init) => {
+      const target = String(url);
+      if (target.startsWith('https://gemini.google.com/')) {
+        const sent = String(init?.headers?.Cookie || init?.headers?.cookie || '');
+        if (sent.includes('someone-else')) {
+          return Promise.resolve(new Response(target.endsWith('/app')
+            ? '<script>window.WIZ_global_data = {"oPEP7c":"someone-else@gmail.com"};</script>'
+            : reply(0.9, 0.9)));
+        }
+        return Promise.resolve(new Response(target.endsWith('/app')
+          ? '<script>window.WIZ_global_data = {"oPEP7c":"mine@gmail.com"};</script>'
+          : reply(0.4, 0.2)));
+      }
+      return realFetch(url, init);
+    };
+    try {
+      const out = await plugin.auth.usage(signIn({ account: 3, email: 'mine@gmail.com', cookie }));
+      assert.equal(out.error, undefined);
+      assert.equal(out.user, 'mine@gmail.com');
+      assert.deepEqual(out.credits.map(c => c.remainingPercent), [60, 80], 'id 3 is another account now');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    assert.equal(accounts.size, 4, 'the sign-in\'s own account was imported beside the one holding its old id');
+  });
+
   it('leaves a backend the plugin did not set up alone', async () => {
     const plugin = await GeminiWebPlugin({});
     const getAuth = async () => ({ type: 'api', key: 'other_key', metadata: { baseURL: 'http://127.0.0.1:9/v1' } });
@@ -921,6 +955,6 @@ describe('29. A host update that takes the backend', () => {
     assert.equal(loaded.baseURL, 'http://127.0.0.1:9/v1');
     const out = await plugin.auth.usage(getAuth);
     assert.match(out.error, /本地后端/);
-    assert.equal(accounts.size, 2);
+    assert.equal(accounts.size, 4);
   });
 });

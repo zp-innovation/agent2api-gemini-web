@@ -84,10 +84,11 @@ async function managedSignIn(auth, opts) {
 
 // healManaged puts the sign-in's account back into the pool of the backend it reaches, and says
 // which entry it is now: after a host update the pool is empty, so the id the sign-in saved names
-// nothing and every read of it fails. The entry is looked up by id, then by email (a re-import
-// numbers it anew), and imported from the sign-in's own cookie when neither finds it. A backend
-// that already has it is left alone; the lookup is throttled because the loader runs on every
-// request and a healthy backend would be read for the pool each time.
+// nothing and every read of it fails. The id it saved is looked up, and the email behind that
+// entry has to be the sign-in's own (a re-import numbers the pool anew, so an id can come to mean
+// another Google account); the account is imported from the sign-in's own cookie when the pool
+// does not have it. A backend that already has it is left alone; the lookup is throttled because
+// the loader runs on every request and a healthy backend would be read for the pool each time.
 const HEAL_TTL_MS = 60 * 1000;
 const healedAt = new Map();
 
@@ -97,7 +98,14 @@ async function healManaged(local, auth) {
   const last = healedAt.get(key);
   if (last && Date.now() - last < HEAL_TTL_MS) return null;
   const pool = await poolAccounts().catch(() => []);
-  const found = pool.find(a => a.id === meta.account) || (meta.email ? pool.find(a => a.email === meta.email) : null);
+  // The pool numbers an entry anew whenever it is imported again, so the id the sign-in saved may
+  // name a different Google account by now — and reading that entry would show its quota. The id
+  // is taken only when the account behind it is still the one the sign-in saved.
+  let found = pool.find(a => a.id === meta.account) || null;
+  if (found && meta.email) {
+    const actual = await accountEmail(found).catch(() => undefined);
+    if (actual && actual !== meta.email) found = null;
+  }
   healedAt.set(key, Date.now());
   if (found) return found;
   if (!meta.cookie) return null;
