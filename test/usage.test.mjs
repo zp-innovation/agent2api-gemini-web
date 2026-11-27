@@ -280,8 +280,10 @@ describe('28. Gemini usage limits', () => {
     const first = await read();
     assert.equal(first.user, 'zero@gmail.com');
     assert.deepEqual(first.credits, creditsOf(windowsOf(parseUsage(reply(0.1, 0)).pools)));
-    assert.equal(first.available, 90);
+    // Magpie reads the card's number from balance and shows availableView as given.
+    assert.equal(first.balance, 90);
     assert.equal(first.unit, '%');
+    assert.equal(first.availableView, '可用 90%');
     assert.equal('windows' in first, false);
     authuser = 1; // changed in the backend's panel
     const out = await read();
@@ -312,7 +314,7 @@ describe('28. Gemini usage limits', () => {
     assert.equal(out.user, 'five@gmail.com +2');
     assert.equal(out.error, undefined);
     assert.deepEqual(out.credits.map(c => [c.name, c.remainingPercent]), [['5 小时窗口', 63], ['7 天窗口', 95]]);
-    assert.equal(out.available, 63);
+    assert.equal(out.balance, 63);
     assert.equal(out.credits[0].grantReason, '各账号已用 five 35%，#6 37%，#7 读取失败');
     assert.equal(out.credits[1].resetAt, Date.parse('2026-10-20T23:48:06.036Z'));
   });
