@@ -148,6 +148,13 @@ describe('25b. Binding an account the pool left without a proxy', () => {
     assert.deepEqual(calls.map(c => `${c.method} ${c.path}`), ['GET /admin/api/cookies', 'GET /admin/api/proxies']);
   });
 
+  it('leaves the account alone while every proxy in the pool is failing', async () => {
+    const calls = [];
+    const { fetchFn } = adminFetch(calls, { proxies: [{ id: 3, url: 'http://127.0.0.1:7890', enabled: true, fail_count: 2 }] });
+    assert.equal(await bindPoolProxy(setup, 7, { fetchFn }), null);
+    assert.deepEqual(calls.map(c => `${c.method} ${c.path}`), ['GET /admin/api/cookies', 'GET /admin/api/proxies']);
+  });
+
   it('refuses to pretend a binding the backend did not record', async () => {
     const { fetchFn } = adminFetch([], { record: false });
     await assert.rejects(bindPoolProxy(setup, 7, { fetchFn }), /没能绑定到代理池里的出口/);
