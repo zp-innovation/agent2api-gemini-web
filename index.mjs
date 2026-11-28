@@ -1,7 +1,7 @@
 import { normalizeBaseURL, settings, credentials, listModels, forward, UNREACHABLE_HEADER, PLUGIN_ICON } from './lib/backend.mjs';
 import { ensureBackend, localBackend, localSetup } from './lib/native.mjs';
 import { registerMagpieCleanup, isPluginRemovedInActiveMagpie } from './lib/cleanup.mjs';
-import { parseCookieInput, parseSignInPaste, parseAuthuser, importCookie, ensureProxy, validateProxyURL, requireLoginBackend, dynamicAskPrompts, apiKeyPrompt, extractApiKey } from './lib/setup.mjs';
+import { parseCookieInput, parseSignInPaste, parseAuthuser, importCookie, ensureProxy, validateProxyURL, requireLoginBackend, dynamicAskPrompts, apiKeyPrompt, extractApiKey, bindPoolProxy } from './lib/setup.mjs';
 import { usage, poolChoices, poolAccounts, accountEmail } from './lib/usage.mjs';
 import { isContainerEnv, dockerProxyHint } from './lib/proc.mjs';
 
@@ -41,6 +41,20 @@ const COOKIE_STEPS = [
 // quickSignIn never asked for an index, so these steps must not refer to one the user typed.
 const QUICK_COOKIE_STEPS = COOKIE_STEPS.replace(ASKED_INDEX_STEP, QUICK_INDEX_STEP).replace(RAW_PASTE_STEP, QUICK_PASTE_STEP);
 
+// bindEgress makes the way out of an account certain before anything reads as it. A pool that has
+// proxies but has not tied this account to one yet leaves the way out unknown: the backend picks a
+// proxy on the account's first request, and until then its keepalive goes out direct, so a read now
+// would show Google the session at a second address (egress in lib/usage.mjs refuses exactly that,
+// which is what leaves such an account with no email and a failed usage card). Binding it first,
+// then reading the entry back, is what turns those into a name and a quota. A pool without proxies,
+// or an account already bound, is left alone and costs one read of the pool.
+async function bindEgress(local, entry) {
+  if (!local || !entry || !Number.isInteger(entry.id) || !entry.pooled || entry.proxy) return entry;
+  await bindPoolProxy(local, entry.id).catch(() => null);
+  const pool = await poolAccounts().catch(() => []);
+  return pool.find(a => a.id === entry.id) || entry;
+}
+
 // signInFor is the Magpie sign-in for one account of the local backend's pool: the backend's
 // key, with the account's id for its usage card and its Google email, which names the card and
 // keeps each Google account a sign-in of its own (Magpie takes two sign-ins with one email for
@@ -55,17 +69,18 @@ const QUICK_COOKIE_STEPS = COOKIE_STEPS.replace(ASKED_INDEX_STEP, QUICK_INDEX_ST
 // — managed: true says the backend is ours to rebuild, and healManaged re-imports the cookie into
 // the pool it comes back with. extra.cookie is the normalized cookie (see parseCookieInput).
 async function signInFor(local, account, extra = {}) {
-  const email = account.email || await accountEmail(account).catch(() => undefined);
+  const entry = await bindEgress(local, account).catch(() => account);
+  const email = entry.email || await accountEmail(entry).catch(() => undefined);
   // A pool entry read by poolAccounts carries its cookie; 添加本地后端里已有的 Google 账号 signs
   // in with one of those, and it heals the same way.
-  const cookie = extra.cookie || account.cookie;
+  const cookie = extra.cookie || entry.cookie;
   return {
     type: 'success',
     key: local.apiKey,
     metadata: {
-      baseURL: local.baseURL, account: account.id, managed: true, ...(email ? { email } : {}),
+      baseURL: local.baseURL, account: entry.id, managed: true, ...(email ? { email } : {}),
       // The account index (/u/N) the email is for; usage takes the email only while it holds.
-      ...(email && account.authuser > 0 ? { authuser: account.authuser } : {}),
+      ...(email && entry.authuser > 0 ? { authuser: entry.authuser } : {}),
       ...(cookie ? { cookie } : {}),
       ...(extra.proxy ? { proxy: extra.proxy } : {})
     }
@@ -134,7 +149,8 @@ async function healManaged(local, auth) {
     ...(meta.authuser > 0 ? { authuser: meta.authuser } : {}),
     ...(meta.proxy ? { proxy: meta.proxy } : {})
   });
-  return (await poolAccounts().catch(() => [])).find(a => a.id === added.id) || { id: added.id };
+  const entry = (await poolAccounts().catch(() => [])).find(a => a.id === added.id) || { id: added.id };
+  return bindEgress(local, entry);
 }
 
 // forwardManaged is forward(), but when the backend this plugin manages can't be reached it
@@ -435,6 +451,12 @@ export const GeminiWebPlugin = async (_input, options = {}) => {
         const meta = auth.metadata || {};
         const healed = local ? await healManaged(local, auth).catch(() => null) : null;
         const account = healed && Number.isInteger(healed.id) ? healed.id : meta.account;
+        // An entry the pool has but has not tied to a proxy yet (imported in the backend's own
+        // panel, say) is bound here first: without that the read has no certain way out.
+        if (local && Number.isInteger(account)) {
+          const entry = (await poolAccounts().catch(() => [])).find(a => a.id === account);
+          if (entry && entry.pooled && !entry.proxy) await bindEgress(local, entry).catch(() => null);
+        }
         const { email, authuser } = meta;
         return { ...(await usage(Number.isInteger(account) ? { account, email, authuser } : {})), signIn: 'kept' };
       }

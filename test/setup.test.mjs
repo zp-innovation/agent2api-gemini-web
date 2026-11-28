@@ -9,7 +9,7 @@ import { EventEmitter } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { GeminiWebPlugin } from '../index.mjs';
 import { binaryPath, ensureBackend, installBackend, localBackend, pinnedBinary } from '../lib/native.mjs';
-import { parseCookieInput, looksLikeCookieMaterial, parseSignInPaste, parseAuthuser, importCookie, ensureProxy, validateProxyURL, requireLoginBackend, REQUIRED_COOKIES } from '../lib/setup.mjs';
+import { parseCookieInput, looksLikeCookieMaterial, parseSignInPaste, parseAuthuser, importCookie, bindPoolProxy, ensureProxy, validateProxyURL, requireLoginBackend, REQUIRED_COOKIES } from '../lib/setup.mjs';
 import { emptyStaticSelects, resolvePrompts, retainAnswered, magpiePassesInputs } from './helpers/host-login-contract.mjs';
 
 const LOGIN_CAPABILITIES = { capabilities: { account_proxy_binding: true } };
@@ -97,6 +97,64 @@ describe('Google session index', () => {
         fetchFn: () => assert.fail('invalid authuser must not reach the backend')
       }), /账号索引须为 0–9 的整数/);
     }
+  });
+});
+
+describe('25b. Binding an account the pool left without a proxy', () => {
+  const setup = { origin: 'http://127.0.0.1:1', adminToken: 'admin_test' };
+
+  // adminFetch answers the pool and proxy reads and records every call; bound is the proxy_id the
+  // pool reports for the account, which a PATCH moves.
+  function adminFetch(calls, { proxyId = 0, proxies = [{ id: 3, url: 'http://127.0.0.1:7890', enabled: true }], record = true } = {}) {
+    const state = { proxyId };
+    return {
+      state,
+      fetchFn: async (url, init) => {
+        const path = new URL(url).pathname;
+        calls.push({ path, method: init.method, body: init.body });
+        if (path === '/admin/api/cookies') return Response.json({ items: [{ id: 7, proxy_id: state.proxyId }] });
+        if (path === '/admin/api/proxies') return Response.json({ items: proxies });
+        if (path === '/admin/api/cookies/7' && init.method === 'PATCH') {
+          const sent = JSON.parse(init.body).proxy_id;
+          if (record) state.proxyId = sent;
+          return Response.json({ ok: true });
+        }
+        return Response.json({ error: 'unexpected' }, { status: 500 });
+      }
+    };
+  }
+
+  it('binds an unbound account to the first enabled proxy and proves it took', async () => {
+    const calls = [];
+    const { fetchFn } = adminFetch(calls);
+    const bound = await bindPoolProxy(setup, 7, { fetchFn });
+    assert.deepEqual(bound, { id: 3, url: 'http://127.0.0.1:7890' });
+    assert.deepEqual(calls.map(c => `${c.method} ${c.path}`),
+      ['GET /admin/api/cookies', 'GET /admin/api/proxies', 'PATCH /admin/api/cookies/7', 'GET /admin/api/cookies']);
+    assert.equal(JSON.parse(calls[2].body).proxy_id, 3);
+  });
+
+  it('leaves an account that already has a proxy alone', async () => {
+    const calls = [];
+    const { fetchFn } = adminFetch(calls, { proxyId: 5 });
+    assert.equal(await bindPoolProxy(setup, 7, { fetchFn }), null);
+    assert.deepEqual(calls.map(c => `${c.method} ${c.path}`), ['GET /admin/api/cookies']);
+  });
+
+  it('leaves the account direct when the pool has no enabled proxy', async () => {
+    const calls = [];
+    const { fetchFn } = adminFetch(calls, { proxies: [{ id: 3, url: 'http://127.0.0.1:7890', enabled: false }] });
+    assert.equal(await bindPoolProxy(setup, 7, { fetchFn }), null);
+    assert.deepEqual(calls.map(c => `${c.method} ${c.path}`), ['GET /admin/api/cookies', 'GET /admin/api/proxies']);
+  });
+
+  it('refuses to pretend a binding the backend did not record', async () => {
+    const { fetchFn } = adminFetch([], { record: false });
+    await assert.rejects(bindPoolProxy(setup, 7, { fetchFn }), /没能绑定到代理池里的出口/);
+  });
+
+  it('does nothing without an account id', async () => {
+    assert.equal(await bindPoolProxy(setup, undefined, { fetchFn: () => assert.fail('no read without an id') }), null);
   });
 });
 
@@ -612,8 +670,11 @@ describe('27. One-click sign-in through the plugin', () => {
     assert.equal(accounts.size, 1);
   });
 
-  it('signs in without the email while the new account has no known way out', async () => {
-    // A pool with proxies: the backend binds the account to one on its first request.
+  it('binds the account to the proxy pool before anything reads as it', async () => {
+    // A pool with a proxy and an account the pool has not tied to it yet: the backend would pick
+    // one on the account's first request, and its keepalive goes out direct until then, so the
+    // sign-in binds it first (bindEgress in index.mjs). Only then is there a way out to read by —
+    // and here that way out is one Node's fetch cannot take, so no read reaches Google at all.
     db.exec(`INSERT INTO proxies VALUES (1, 'p1', 'http://127.0.0.1:7890', 1)`);
     const pending = await (await oauthMethod()).authorize();
     const realFetch = globalThis.fetch;
@@ -627,11 +688,12 @@ describe('27. One-click sign-in through the plugin', () => {
       result = await pending.callback(SIGNED_IN.replace('SID=v-SID', 'SID=good-pooled'));
     } finally {
       globalThis.fetch = realFetch;
-      db.exec('DELETE FROM proxies');
     }
+    const bound = db.prepare('SELECT proxy_id FROM accounts WHERE id = ?').get(result.metadata.account);
+    db.exec('DELETE FROM proxies');
     assert.equal(result.type, 'success');
     assert.equal(result.metadata.account, nextId - 1);
-    assert.equal(result.metadata.email, undefined);
+    assert.equal(bound.proxy_id, 1, 'the account must be bound to the proxy pool');
     assert.deepEqual(google, []);
   });
 
@@ -939,6 +1001,18 @@ describe('29. A host update that takes the backend', () => {
         if (req.method === 'POST' && /^\/admin\/api\/cookies\/\d+\/check$/.test(req.url)) {
           return send(200, { ok: true, detail: 'ok' });
         }
+        if (req.method === 'GET' && req.url === '/admin/api/proxies') {
+          const items = db.prepare('SELECT id, name, url, enabled FROM proxies ORDER BY id').all()
+            .map(p => ({ ...p, enabled: p.enabled === 1, fail_count: 0 }));
+          return send(200, { items });
+        }
+        if (req.method === 'PATCH' && /^\/admin\/api\/cookies\/\d+$/.test(req.url)) {
+          const parsed = JSON.parse(body);
+          if (Number.isInteger(parsed.proxy_id)) {
+            db.prepare('UPDATE accounts SET proxy_id = ? WHERE id = ?').run(parsed.proxy_id, Number(req.url.split('/').pop()));
+          }
+          return send(200, { ok: true });
+        }
         send(404, { error: 'not found' });
       });
     });
@@ -1007,6 +1081,32 @@ describe('29. A host update that takes the backend', () => {
       globalThis.fetch = realFetch;
     }
     assert.equal(accounts.size, 2, 'the account was put back before the read, not read from a pool that has it');
+  });
+
+  it('binds an account the pool left without a proxy before reading its card', async () => {
+    // An account imported in the backend's own panel has no proxy until its first request, and its
+    // keepalive goes out direct until then: reading it first would show Google the session at a
+    // second address (egress in lib/usage.mjs). The read binds it to the pool's proxy instead.
+    const plugin = await GeminiWebPlugin({});
+    db.exec(`INSERT INTO proxies VALUES (1, 'p1', 'http://127.0.0.1:7890', 1)`);
+    const id = 900;
+    db.prepare(`INSERT INTO accounts (id, label, cookie, status, proxy_id, authuser) VALUES (?, 'panel', ?, 'enabled', 0, 0)`)
+      .run(id, signedInAs('panel'));
+    const realFetch = globalThis.fetch;
+    const google = [];
+    globalThis.fetch = (url, init) => {
+      if (String(url).startsWith('https://gemini.google.com/')) google.push(String(url));
+      return realFetch(url, init);
+    };
+    try {
+      await plugin.auth.usage(signIn({ account: id, email: 'panel@gmail.com' }));
+    } finally {
+      globalThis.fetch = realFetch;
+      db.exec('DELETE FROM proxies');
+    }
+    assert.equal(db.prepare('SELECT proxy_id FROM accounts WHERE id = ?').get(id).proxy_id, 1,
+      'the account must be bound to the proxy pool before the read');
+    assert.deepEqual(google, [], 'no read may leave before the way out is known');
   });
 
   it('reads its own account, not the one the pool numbers alike', async () => {
